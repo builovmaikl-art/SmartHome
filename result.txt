@@ -33,7 +33,10 @@ TYPE E_Gateway_Command_Type :
     CMD_SET_TEMP := 5,
     CMD_SET_VENT := 6,
     CMD_SET_BLINDS := 7,
-    CMD_TELEGRAM_MSG := 8
+    CMD_TELEGRAM_MSG := 8,
+    CMD_SYNC_TIME := 9,
+    CMD_ACK_ALARM := 10,
+    CMD_SET_CONFIG := 11
 ) USINT;
 END_TYPE
 
@@ -189,7 +192,8 @@ TYPE E_Valve_Test_Result :
     TEST_RESULT_TIME_DEVIATION := 3,
     TEST_RESULT_STALL := 4,
     TEST_RESULT_LIMIT_SWITCH_FAIL := 5,
-    TEST_RESULT_ABORTED := 6
+    TEST_RESULT_ABORTED := 6,
+    TEST_RESULT_IN_PROGRESS := 7
 ) USINT;
 END_TYPE
 
@@ -492,6 +496,20 @@ END_STRUCT
 END_TYPE
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+TYPE ST_Hardware_Integration_Status :
+STRUCT
+    output_contract_ok : BOOL := TRUE;
+    lighting_contract_ok : BOOL := TRUE;
+    blinds_contract_ok : BOOL := TRUE;
+    vent_contract_ok : BOOL := TRUE;
+    heating_contract_ok : BOOL := TRUE;
+    last_error_code : UDINT := 0;
+    last_error_text : STRING(120) := '';
+    last_update_ms : UDINT := 0;
+END_STRUCT
+END_TYPE
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 TYPE ST_Lifetime_Status :
 STRUCT
     device_id : BYTE;
@@ -606,6 +624,10 @@ STRUCT
     auto_arm_enabled : BOOL := FALSE;
     auto_arm_time_ms : UDINT := 0;
     enable_2fa : BOOL := TRUE; // Включение/отключение двухфакторной аутентификации
+    two_factor_method : E_TwoFactor_Method := E_TwoFactor_Method.TF_METHOD_TOTP;
+    two_factor_timeout_ms : UDINT := GVL_CONSTANTS.C_MS_IN_MINUTE * 5;
+    two_factor_max_attempts : BYTE := 3;
+    two_factor_totp_secret : STRING(32) := 'OVENSMART2FA-SECRET-000000000001';
     gate_open_pulse_ms : UDINT := GVL_CONSTANTS.C_MS_IN_SECOND;
     wicket_open_pulse_ms : UDINT := GVL_CONSTANTS.C_MS_IN_SECOND;
     lock_open_pulse_ms : UDINT := GVL_CONSTANTS.C_MS_IN_SECOND;
@@ -816,7 +838,7 @@ STRUCT
     default_supply_speed : BYTE := 40;
     default_exhaust_speed : BYTE := 40;
     Scenario_Modes : ARRAY[1..GVL_CONSTANTS.C_MAX_SCENARIOS] OF ST_Ventilation_Scenario_Mode;
-    wet_zone_to_exhaust_map : ARRAY[1..GVL_CONSTANTS.C_MAX_WET_ZONES] OF INT := [2, 3, 4, 5]; // Привязка мокрых зон к вытяжным вентиляторам
+    wet_zone_to_exhaust_map : ARRAY[1..GVL_CONSTANTS.C_MAX_WET_ZONES] OF INT := [1, 2, 3, 4, 5]; // Привязка 5 мокрых зон к вытяжным вентиляторам
     pv3_exhaust_index : INT := 3; // Индекс вытяжного вентилятора ПВ-3
 END_STRUCT
 END_TYPE
@@ -923,8 +945,6 @@ VAR_GLOBAL
     G_PIN_Code : STRING(4);
     G_RFID_Tag : STRING(20);
     G_2FA_Code_In : STRING(6);
-    G_Send_2FA_Req : BOOL;
-    G_2FA_Code_Out : STRING(6);
     G_Lighting_Override : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BYTE;
     G_Blinds_Override : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF BYTE;
     G_Socket_Override : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL;
@@ -985,6 +1005,12 @@ VAR_GLOBAL
     // Сетевая безопасность
     G_Allowed_IPs : ARRAY[1..GVL_CONSTANTS.C_MAX_ALLOWED_IPS] OF STRING(15) := ['192.168.1.100', '192.168.1.101', '127.0.0.1', '', '']; // Разрешенные IP-адреса для шлюза
 
+    // Подготовка к аппаратной интеграции
+    G_Hardware_Interface_Enable : BOOL := TRUE;
+    G_Hardware_Interface_Strict_Mode : BOOL := TRUE;
+    G_DALI_Zone_Map : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF UINT := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    G_KNX_Blinds_Map : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF UINT := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+
     // IO Mapping
     G_FloorTemp_Map : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF INT := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     G_RoomTemp_Map : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF INT := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
@@ -998,7 +1024,7 @@ VAR_GLOBAL CONSTANT
     C_MIN_PER_HOUR  : UDINT := 60; // Минут в часе
     C_MS_PER_MIN    : UDINT := GVL_CONSTANTS.C_MS_IN_MINUTE; // Миллисекунд в минуте
     C_MAX_RULES     : INT := 20; // Максимальное количество пользовательских правил
-    C_ZONE_COUNT    : BYTE := 18; // Общее количество зон в системе
+    C_ZONE_COUNT    : BYTE := 16; // Общее количество зон в системе
     
     // Коды ошибок
     ERR_PRESSURE_OUT_OF_RANGE : UDINT := 16#E004;
@@ -1010,7 +1036,7 @@ END_VAR
 VAR_GLOBAL CONSTANT
     // Размеры массивов (конфигурация системы)
     C_MAX_ZONES            : INT := 16; // Максимальное количество зон (комнат)
-    C_MAX_SOCKETS          : INT := 36; // Максимальное количество управляемых розеток
+    C_MAX_SOCKETS          : INT := 16; // Максимальное количество групп розеток по помещениям
     C_MAX_BLINDS           : INT := 20; // Максимальное количество штор/жалюзи
     C_MAX_ALARMS           : INT := 20; // Максимальное количество активных тревог
     C_MAX_RULES            : INT := 20; // Максимальное количество правил (движок правил)
@@ -1026,10 +1052,10 @@ VAR_GLOBAL CONSTANT
     C_MAX_VENT_UNITS       : INT := 8;  // Максимальное количество вентустановок
     C_MAX_SUPPLY_TEMPS     : INT := 2;  // Максимальное количество датчиков температуры притока
     C_MAX_SMOKE_SENSORS    : INT := 6;  // Максимальное количество датчиков дыма
-    C_MAX_SCENARIOS        : INT := 6;  // Максимальное количество сценариев
+    C_MAX_SCENARIOS        : INT := 7;  // Максимальное количество сценариев
     C_MAX_OUTDOOR_ZONES    : INT := 4;  // Максимальное количество зон уличного освещения
     C_MAX_ACCESS_CODES     : INT := 10; // Максимальное количество кодов доступа
-    C_MAX_WET_ZONES        : INT := 4;  // Максимальное количество "мокрых" зон (санузлы)
+    C_MAX_WET_ZONES        : INT := 5;  // Максимальное количество "мокрых" зон с контролем влажности
     C_MAX_CALIBRATIONS     : INT := 20; // Максимальное количество калибровок датчиков
     C_MAX_MODULES          : INT := 10; // Максимальное количество модулей ввода-вывода
     C_MAX_CLEANING_MODES   : INT := 3;  // Максимальное количество режимов уборки
@@ -1037,7 +1063,7 @@ VAR_GLOBAL CONSTANT
     C_MAX_VENT_SUPPLY_MODES: INT := 3;  // Максимальное количество режимов притока вентиляции
     C_MAX_SECURITY_PHONES  : INT := 5;  // Максимальное количество телефонов для оповещения
     C_MAX_FLOOD_VALVES     : INT := 3;  // Максимальное количество кранов защиты от протечек
-    C_MAX_HUMIDITY_SENSORS : INT := 8;  // Максимальное количество датчиков влажности
+    C_MAX_HUMIDITY_SENSORS : INT := 5;  // Максимальное количество датчиков влажности в мокрых зонах
     C_MAX_CO2_SENSORS      : INT := 8;  // Максимальное количество датчиков CO2
     C_MAX_CIRCUITS_PER_MANIFOLD : INT := 4; // Максимальное количество контуров на коллектор
     C_MAX_TREND_DATA_POINTS: INT := 100; // Максимальное количество точек данных для трендов
@@ -1095,6 +1121,10 @@ VAR_GLOBAL
     G_Gateway_Ping_OK : BOOL;
     G_Gateway_Data_Ready : BOOL;
     G_Gateway_Modbus_Registers : ARRAY[0..GVL_CONSTANTS.C_MAX_MODBUS_REGISTERS-1] OF WORD;
+    G_DALI_Lighting_Levels : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BYTE;
+    G_KNX_Blinds_Positions : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF BYTE;
+    G_DALI_Command_Update : BOOL;
+    G_KNX_Command_Update : BOOL;
 END_VAR
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -1125,7 +1155,7 @@ VAR_GLOBAL
     AI_Temp_Outdoor : ST_Owen_Analog_Value; // Аналоговый вход: Наружная температура воздуха (уличный датчик)
     AI_Floor_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Аналоговые входы: Температура стяжки пола по зонам (датчики в гильзах)
     AI_Room_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Аналоговые входы: Температура воздуха в помещениях (настенные датчики)
-    AI_Room_Hum : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Аналоговые входы: Влажность воздуха в помещениях (%)
+    AI_Room_Hum : ARRAY[1..GVL_CONSTANTS.C_MAX_HUMIDITY_SENSORS] OF REAL; // Аналоговые входы: Влажность в 5 мокрых зонах (%)
     AI_Room_CO2 : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Аналоговые входы: Уровень CO2 в помещениях (ppm)
     DO_Zone_Valves : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BOOL; // Дискретные выходы: Термоэлектрические приводы контуров (220В)
     AI_DHW_Temp : REAL; // Аналоговый вход: Температура воды в бойлере косвенного нагрева
@@ -1133,9 +1163,9 @@ VAR_GLOBAL
     DO_DHW_Heating_Pump : BOOL; // Дискретный выход: Насос загрузки бойлера (первичный контур от котла)
     DO_DHW_Circ_Pump : BOOL; // Дискретный выход: Насос рециркуляции ГВС (кольцо потребителей)
     DI_Lighting_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BOOL; // Дискретные входы: Физические кнопки/выключатели (импульсные)
-    DI_Socket_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Дискретные входы: Физические кнопки/выключатели для розеток
+    DI_Socket_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Дискретные входы: Кнопки управления групповыми розетками по помещениям
     DI_Motion_Sensors : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BOOL; // Дискретные входы: Датчики присутствия (PIR-сенсоры)
-    DO_Sockets : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Дискретные выходы: Управление розетками (реле)
+    DO_Sockets : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Дискретные выходы: Управление групповыми розетками по помещениям (реле)
     DO_Gas_Valve_Close : BOOL; // Дискретный выход: Импульс на закрытие электромагнитного газового клапана
     DO_Water_Valve_35_Close : BOOL; // Дискретный выход: Закрыть вводной шаровый кран воды №1 (с электроприводом)
     DO_Water_Valve_36_Close : BOOL; // Дискретный выход: Закрыть вводной шаровый кран воды №2 (с электроприводом)
@@ -1201,7 +1231,7 @@ END_VAR
 VAR_GLOBAL
     G_Floor_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Массив текущих температур поверхности пола
     G_Room_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL;
-    G_Room_Hum : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL;
+    G_Room_Hum : ARRAY[1..GVL_CONSTANTS.C_MAX_HUMIDITY_SENSORS] OF REAL; // Влажность в мокрых зонах
     G_Room_CO2 : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL;
     G_Motion_Sensors : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BOOL;
     G_Door_Sensors : ARRAY[1..GVL_CONSTANTS.C_MAX_DOOR_SENSORS] OF BOOL;
@@ -1217,19 +1247,19 @@ VAR_GLOBAL
     G_Boiler_Flame : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF BOOL;
     G_Boiler_Error : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF BOOL;
     G_Physical_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BOOL;
-    G_Socket_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Физические выключатели розеток
+    G_Socket_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Физические выключатели групп розеток по помещениям
     G_Outdoor_Temp : REAL;
     G_Supply_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_SUPPLY_TEMPS] OF REAL; // Температура приточного воздуха после калорифера
     G_DHW_Temp : REAL;
     G_DHW_Pressure : REAL;
     G_Zone_Valves : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BOOL;
     G_Manifold_Pumps : ARRAY[1..GVL_CONSTANTS.C_MAX_MANIFOLDS] OF BOOL;
-    G_Manifold_Valves : ARRAY[1..GVL_CONSTANTS.C_MAX_MANIFOLDS] OF REAL; // 0.0 - 1.0
+    G_Manifold_Valves : ARRAY[1..GVL_CONSTANTS.C_MAX_MANIFOLDS] OF REAL; // 0.0 - 100.0%
     G_Manifold_End_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_MANIFOLDS] OF BOOL; // Концевики клапанов
     G_Boiler_Enable : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF BOOL;
     G_Boiler_Setpoint : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF REAL;
-    G_Supply_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_SUPPLY_FANS] OF REAL; // 0.0 - 1.0
-    G_Exhaust_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_EXHAUST_FANS] OF REAL; // 0.0 - 1.0
+    G_Supply_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_SUPPLY_FANS] OF BYTE; // 0 - 100%
+    G_Exhaust_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_EXHAUST_FANS] OF BYTE; // 0 - 100%
     G_Vent_Heater_Power : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF REAL;
     G_Lighting_Levels : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BYTE;
     G_Blinds_Positions : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF BYTE;
@@ -1266,7 +1296,8 @@ VAR_GLOBAL
     G_Boiler_Status : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF ST_Boiler_Status;
     G_IO_Modules_Online : ARRAY[1..GVL_CONSTANTS.C_MAX_MODULES] OF BOOL; // Статусы модулей ввода-вывода
     G_Sim_Active : BOOL;
-    G_Wet_Zone_Light_Active : BOOL;
+    G_Wet_Zone_Light_Active : ARRAY[1..GVL_CONSTANTS.C_MAX_WET_ZONES] OF BOOL;
+    G_Hardware_Interface_Status : ST_Hardware_Integration_Status;
 END_VAR
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -1701,6 +1732,7 @@ END_IF;
 FUNCTION_BLOCK FB_Astro_Timer
 VAR_INPUT
     VI_System_Time_MS : UDINT;
+    VI_Current_TOD : TOD; // Текущее время суток передается вызывающей программой
     VI_Latitude : REAL := 55.75; // Москва (по умолчанию)
     VI_Longitude : REAL := 37.61;
     VI_Timezone : REAL := 3.0; // UTC+3
@@ -1726,7 +1758,7 @@ VAR
     L_Sunset_Local : REAL;
 END_VAR
 
-L_Current_TOD := GVL_STATUS.G_Current_TOD;
+L_Current_TOD := VI_Current_TOD;
 VO_Current_TOD := L_Current_TOD;
 
 // Equation of Time (EoT) in minutes
@@ -4355,7 +4387,7 @@ VAR_INPUT
     VI_Rules : ARRAY[1..GVL_CONSTANTS.C_MAX_RULES] OF ST_User_Rule; // Массив пользовательских правил
     VI_Indoor_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Температуры в помещениях
     VI_Floor_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Температуры пола
-    VI_Humidities : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Влажность в помещениях
+    VI_Humidities : ARRAY[1..GVL_CONSTANTS.C_MAX_HUMIDITY_SENSORS] OF REAL; // Влажность в мокрых зонах
     VI_CO2_Levels : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Уровни CO2
     VI_Motion_Sensors : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BOOL; // Датчики движения
     VI_Door_Sensors : ARRAY[1..GVL_CONSTANTS.C_MAX_DOOR_SENSORS] OF BOOL; // Датчики открытия дверей
@@ -4404,7 +4436,7 @@ FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_RULES DO
             CASE VI_Rules[L_i].Condition_Type OF
                 E_Rule_Condition_Type.COND_AIR_TEMP: IF VI_Rules[L_i].Condition_Target_ID <= GVL_CONSTANTS.C_MAX_ZONES THEN L_Current_Value := VI_Indoor_Temps[VI_Rules[L_i].Condition_Target_ID]; END_IF;
                 E_Rule_Condition_Type.COND_FLOOR_TEMP: IF VI_Rules[L_i].Condition_Target_ID <= GVL_CONSTANTS.C_MAX_ZONES THEN L_Current_Value := VI_Floor_Temps[VI_Rules[L_i].Condition_Target_ID]; END_IF;
-                E_Rule_Condition_Type.COND_HUMIDITY: IF VI_Rules[L_i].Condition_Target_ID <= GVL_CONSTANTS.C_MAX_ZONES THEN L_Current_Value := VI_Humidities[VI_Rules[L_i].Condition_Target_ID]; END_IF;
+                E_Rule_Condition_Type.COND_HUMIDITY: IF VI_Rules[L_i].Condition_Target_ID <= GVL_CONSTANTS.C_MAX_HUMIDITY_SENSORS THEN L_Current_Value := VI_Humidities[VI_Rules[L_i].Condition_Target_ID]; END_IF;
                 E_Rule_Condition_Type.COND_CO2: IF VI_Rules[L_i].Condition_Target_ID <= GVL_CONSTANTS.C_MAX_ZONES THEN L_Current_Value := VI_CO2_Levels[VI_Rules[L_i].Condition_Target_ID]; END_IF;
                 E_Rule_Condition_Type.COND_MOTION: IF VI_Rules[L_i].Condition_Target_ID <= GVL_CONSTANTS.C_MAX_ZONES THEN L_Current_Value := SEL(VI_Motion_Sensors[VI_Rules[L_i].Condition_Target_ID], 0.0, 1.0); END_IF;
                 E_Rule_Condition_Type.COND_DOOR_WINDOW: 
@@ -4660,9 +4692,12 @@ END_IF;
 fbTwoFactor(
     VI_System_Time_MS := VI_System_Time_MS,
     VI_Start_Auth := L_2FA_Required,
-    VI_Method := E_TwoFactor_Method.TF_METHOD_TOTP, // Для примера
+    VI_Method := VI_Config.two_factor_method,
     VI_User_Code := VI_2FA_Code, // Используем отдельный вход для 2FA кода
-    VI_Reset_Success := L_Reset_2FA
+    VI_Reset_Success := L_Reset_2FA,
+    VI_Shared_Secret := VI_Config.two_factor_totp_secret,
+    VI_Max_Attempts := VI_Config.two_factor_max_attempts,
+    VI_Timeout_MS := VI_Config.two_factor_timeout_ms
 );
 
 VO_Send_Code_Req := fbTwoFactor.VO_Send_Code_Req;
@@ -5104,14 +5139,14 @@ END_IF;
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 FUNCTION_BLOCK FB_Socket_Manager
-// Менеджер управления розетками.
-// Обеспечивает работу по сценариям, физическим выключателям, правилам и аварийное отключение.
+// Менеджер управления групповыми розетками по помещениям.
+// Обеспечивает работу по сценариям, физическим выключателям, правилам и аварийное отключение по комнатным группам.
 VAR_INPUT
     VI_System_Time_MS : UDINT; // Системное время в миллисекундах
     VI_IsActivePLC : BOOL; // Флаг активности ПЛК (TRUE = ведущий)
     VI_Scenario : E_SCENARIO_TYPE; // Текущий глобальный сценарий
-    VI_Manual_Override : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Ручное переопределение состояния (HMI)
-    VI_Physical_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Физические выключатели розеток
+    VI_Manual_Override : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Ручное переопределение состояния групп розеток (HMI)
+    VI_Physical_Switches : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Физические выключатели групп розеток по помещениям
     VI_Rule_Actions : ARRAY[1..GVL_CONSTANTS.C_MAX_RULES] OF ST_Rule_Action; // Действия от Rule Engine
     VI_Fire_Alarm : BOOL; // Флаг пожарной тревоги
     VI_Flood_Alarm : BOOL; // Флаг тревоги протечки
@@ -5119,7 +5154,7 @@ VAR_INPUT
     VI_IO_Modules_Online : ARRAY[1..GVL_CONSTANTS.C_MAX_MODULES] OF BOOL; // Статусы модулей ввода-вывода
 END_VAR
 VAR_OUTPUT
-    VO_Socket_States : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Выходные состояния розеток
+    VO_Socket_States : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Выходные состояния групп розеток по помещениям
     VO_Internal_States : ARRAY[1..GVL_CONSTANTS.C_MAX_SOCKETS] OF BOOL; // Внутренние состояния для репликации
 END_VAR
 VAR
@@ -5157,7 +5192,7 @@ FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_SOCKETS DO
         L_Internal_State[L_i] := NOT L_Internal_State[L_i];
     END_IF;
 
-    // Проверка правил для текущей розетки
+    // Проверка правил для текущей групповой розетки помещения
     FOR L_j := 1 TO GVL_CONSTANTS.C_MAX_RULES DO
         IF VI_Rule_Actions[L_j].Active AND VI_Rule_Actions[L_j].Target_ID = L_i THEN
             IF VI_Rule_Actions[L_j].Action_Type = E_Rule_Action_Type.ACTION_SET_SOCKET THEN
@@ -5172,7 +5207,7 @@ FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_SOCKETS DO
 
     // Аварийное отключение
     IF VI_Fire_Alarm OR VI_Flood_Alarm THEN
-        // Розетки 1-4 неотключаемые (холодильник, сервер и т.д.)
+        // Группы 1-4 неотключаемые (холодильник, сервер и т.д.)
         IF L_i > 4 THEN
             VO_Socket_States[L_i] := FALSE;
         ELSE
@@ -5184,7 +5219,7 @@ FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_SOCKETS DO
         IF L_i > 4 THEN
             VO_Socket_States[L_i] := FALSE;
         ELSE
-            // Неотключаемые розетки могут управляться вручную
+            // Неотключаемые группы розеток могут управляться вручную
             VO_Socket_States[L_i] := L_Internal_State[L_i];
         END_IF;
     ELSE
@@ -5583,6 +5618,9 @@ VAR_INPUT
     VI_Method         : E_TwoFactor_Method;
     VI_User_Code      : STRING(6);
     VI_Reset_Success  : BOOL; // Сброс успешного состояния
+    VI_Shared_Secret  : STRING(32);
+    VI_Max_Attempts   : BYTE := 3;
+    VI_Timeout_MS     : UDINT := GVL_CONSTANTS.C_MS_IN_MINUTE * 5;
 END_VAR
 VAR_OUTPUT
     VO_State          : ST_TwoFactor_Auth_State;
@@ -5600,6 +5638,7 @@ VAR
     L_Time_Step       : UDINT;
     L_Message         : ARRAY[0..7] OF BYTE;
     L_Key             : ARRAY[0..63] OF BYTE;
+    L_Key_Length      : INT;
     L_Offset          : INT;
     L_Truncated_Hash  : UDINT;
     L_i               : INT;
@@ -5617,26 +5656,49 @@ END_IF;
 IF R_Trig_Start.Q AND NOT VO_State.is_pending AND NOT VO_State.Is_Locked THEN
     VO_State.is_pending := TRUE;
     VO_State.Method := VI_Method;
+    VO_State.start_time := VI_System_Time_MS;
+    VO_State.timeout_ms := VI_Timeout_MS;
     L_Start_Time := VI_System_Time_MS;
-    VO_State.Attempts_Left := 3;
+    VO_State.Attempts_Left := VI_Max_Attempts;
     VO_State.Is_Success := FALSE;
     VO_State.Is_Locked := FALSE;
     L_Prev_User_Code := '';
     
-    IF VI_Method <> E_TwoFactor_Method.TF_METHOD_TOTP THEN
-        // Генерируем случайный код (упрощенно, на основе времени)
-        L_Truncated_Hash := VI_System_Time_MS MOD 1000000;
-        L_Generated_Code := UDINT_TO_STRING(L_Truncated_Hash);
-        WHILE LEN(L_Generated_Code) < 6 DO
-            L_Generated_Code := CONCAT('0', L_Generated_Code);
-        END_WHILE;
-        
-        VO_Code_To_Send := L_Generated_Code;
-        VO_Send_Code_Req := TRUE;
-    ELSE
-        // Для TOTP код не отправляем
+    L_Key_Length := LEN(VI_Shared_Secret);
+    IF L_Key_Length > 32 THEN
+        L_Key_Length := 32;
+    END_IF;
+    FOR L_i := 0 TO 63 DO
+        IF L_i < L_Key_Length THEN
+            L_Key[L_i] := TO_BYTE(VI_Shared_Secret[L_i + 1]);
+        ELSE
+            L_Key[L_i] := 0;
+        END_IF;
+    END_FOR;
+    
+    L_Time_Step := VI_System_Time_MS / 30000;
+    FOR L_i := 0 TO 7 DO
+        L_Message[7 - L_i] := TO_BYTE(SHR(L_Time_Step, L_i * 8) AND 16#FF);
+    END_FOR;
+    fbHMAC(Key := L_Key, KeyLength := L_Key_Length, Message := L_Message, MessageLength := 8);
+    L_Offset := TO_INT(fbHMAC.Hash[19] AND 16#0F);
+    L_Truncated_Hash := (SHL(TO_UDINT(fbHMAC.Hash[L_Offset] AND 16#7F), 24) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+1] AND 16#FF), 16) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+2] AND 16#FF), 8) OR TO_UDINT(fbHMAC.Hash[L_Offset+3] AND 16#FF));
+    L_Generated_Code := UDINT_TO_STRING(L_Truncated_Hash MOD 1000000);
+    WHILE LEN(L_Generated_Code) < 6 DO
+        L_Generated_Code := CONCAT('0', L_Generated_Code);
+    END_WHILE;
+    
+    IF VI_Method = E_TwoFactor_Method.TF_METHOD_TOTP THEN
         VO_Code_To_Send := '';
         VO_Send_Code_Req := FALSE;
+    ELSIF VI_Method = E_TwoFactor_Method.TF_METHOD_NONE THEN
+        VO_Code_To_Send := '';
+        VO_Send_Code_Req := FALSE;
+        VO_State.Is_Success := TRUE;
+        VO_State.is_pending := FALSE;
+    ELSE
+        VO_Code_To_Send := L_Generated_Code;
+        VO_Send_Code_Req := TRUE;
     END_IF;
 ELSE
     VO_Send_Code_Req := FALSE;
@@ -5645,43 +5707,54 @@ END_IF;
 IF VO_State.is_pending THEN
     L_Elapsed_Time := F_TimeDiff(VI_System_Time_MS, L_Start_Time);
 
-    IF L_Elapsed_Time < (GVL_CONSTANTS.C_MS_IN_MINUTE * 5) THEN
-        VO_State.Time_Left_S := TO_UINT(((GVL_CONSTANTS.C_MS_IN_MINUTE * 5) - L_Elapsed_Time) / 1000);
+    IF L_Elapsed_Time < VO_State.timeout_ms THEN
+        VO_State.Time_Left_S := TO_UINT((VO_State.timeout_ms - L_Elapsed_Time) / 1000);
     ELSE
         VO_State.Time_Left_S := 0;
     END_IF;
     
     IF VI_User_Code <> '' AND VI_User_Code <> L_Prev_User_Code THEN
         L_Code_Valid := FALSE;
+        L_Key_Length := LEN(VI_Shared_Secret);
+        IF L_Key_Length > 32 THEN
+            L_Key_Length := 32;
+        END_IF;
+        FOR L_i := 0 TO 63 DO
+            IF L_i < L_Key_Length THEN
+                L_Key[L_i] := TO_BYTE(VI_Shared_Secret[L_i + 1]);
+            ELSE
+                L_Key[L_i] := 0;
+            END_IF;
+        END_FOR;
         
-        IF VI_Method = E_TwoFactor_Method.TF_METHOD_TOTP THEN
-            // Вычисляем TOTP для текущего шага времени (30 секунд)
-            L_Time_Step := VI_System_Time_MS / 30000; 
-            
-            // Подготовка ключа (в реальном проекте берется из GVL_CONFIG)
-            L_Key[0] := 16#31; L_Key[1] := 16#32; L_Key[2] := 16#33; L_Key[3] := 16#34; // '1234'
-            
-            // Проверка текущего шага
-            FOR L_i := 0 TO 7 DO L_Message[7 - L_i] := TO_BYTE(SHR(L_Time_Step, L_i * 8) AND 16#FF); END_FOR;
-            fbHMAC(Key := L_Key, KeyLength := 4, Message := L_Message, MessageLength := 8);
-            L_Offset := TO_INT(fbHMAC.Hash[19] AND 16#0F);
-            L_Truncated_Hash := (SHL(TO_UDINT(fbHMAC.Hash[L_Offset] AND 16#7F), 24) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+1] AND 16#FF), 16) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+2] AND 16#FF), 8) OR TO_UDINT(fbHMAC.Hash[L_Offset+3] AND 16#FF));
-            L_Current_TOTP := UDINT_TO_STRING(L_Truncated_Hash MOD 1000000);
-            WHILE LEN(L_Current_TOTP) < 6 DO L_Current_TOTP := CONCAT('0', L_Current_TOTP); END_WHILE;
-            
-            // Проверка предыдущего шага (для компенсации рассинхронизации)
+        L_Time_Step := VI_System_Time_MS / 30000;
+        
+        // Проверка текущего шага
+        FOR L_i := 0 TO 7 DO L_Message[7 - L_i] := TO_BYTE(SHR(L_Time_Step, L_i * 8) AND 16#FF); END_FOR;
+        fbHMAC(Key := L_Key, KeyLength := L_Key_Length, Message := L_Message, MessageLength := 8);
+        L_Offset := TO_INT(fbHMAC.Hash[19] AND 16#0F);
+        L_Truncated_Hash := (SHL(TO_UDINT(fbHMAC.Hash[L_Offset] AND 16#7F), 24) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+1] AND 16#FF), 16) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+2] AND 16#FF), 8) OR TO_UDINT(fbHMAC.Hash[L_Offset+3] AND 16#FF));
+        L_Current_TOTP := UDINT_TO_STRING(L_Truncated_Hash MOD 1000000);
+        WHILE LEN(L_Current_TOTP) < 6 DO L_Current_TOTP := CONCAT('0', L_Current_TOTP); END_WHILE;
+        
+        // Проверка предыдущего шага (для компенсации рассинхронизации)
+        IF L_Time_Step > 0 THEN
             FOR L_i := 0 TO 7 DO L_Message[7 - L_i] := TO_BYTE(SHR(L_Time_Step - 1, L_i * 8) AND 16#FF); END_FOR;
-            fbHMAC(Key := L_Key, KeyLength := 4, Message := L_Message, MessageLength := 8);
+            fbHMAC(Key := L_Key, KeyLength := L_Key_Length, Message := L_Message, MessageLength := 8);
             L_Offset := TO_INT(fbHMAC.Hash[19] AND 16#0F);
             L_Truncated_Hash := (SHL(TO_UDINT(fbHMAC.Hash[L_Offset] AND 16#7F), 24) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+1] AND 16#FF), 16) OR SHL(TO_UDINT(fbHMAC.Hash[L_Offset+2] AND 16#FF), 8) OR TO_UDINT(fbHMAC.Hash[L_Offset+3] AND 16#FF));
             L_Prev_TOTP := UDINT_TO_STRING(L_Truncated_Hash MOD 1000000);
             WHILE LEN(L_Prev_TOTP) < 6 DO L_Prev_TOTP := CONCAT('0', L_Prev_TOTP); END_WHILE;
-            
+        ELSE
+            L_Prev_TOTP := L_Current_TOTP;
+        END_IF;
+        
+        IF VI_Method = E_TwoFactor_Method.TF_METHOD_TOTP THEN
             IF VI_User_Code = L_Current_TOTP OR VI_User_Code = L_Prev_TOTP THEN
                 L_Code_Valid := TRUE;
             END_IF;
-        ELSE
-            IF VI_User_Code = L_Generated_Code THEN
+        ELSIF VI_Method = E_TwoFactor_Method.TF_METHOD_RFID OR VI_Method = E_TwoFactor_Method.TF_METHOD_BOTH THEN
+            IF VI_User_Code = L_Generated_Code OR VI_User_Code = L_Current_TOTP OR VI_User_Code = L_Prev_TOTP THEN
                 L_Code_Valid := TRUE;
             END_IF;
         END_IF;
@@ -5697,19 +5770,19 @@ IF VO_State.is_pending THEN
             IF VO_State.Attempts_Left = 0 THEN
                 VO_State.Is_Locked := TRUE;
                 VO_State.is_pending := FALSE;
-                L_Lockout_Start_Time := VI_System_Time_MS; // Блокировка на 5 минут
+                L_Lockout_Start_Time := VI_System_Time_MS; // Блокировка на время таймаута
             END_IF;
         END_IF;
     END_IF;
     L_Prev_User_Code := VI_User_Code;
     
-    IF L_Elapsed_Time > (GVL_CONSTANTS.C_MS_IN_MINUTE * 5) THEN
+    IF L_Elapsed_Time > VO_State.timeout_ms THEN
         VO_State.is_pending := FALSE; // Таймаут
     END_IF;
 END_IF;
 
 IF VO_State.Is_Locked THEN
-    IF F_TimeDiff(VI_System_Time_MS, L_Lockout_Start_Time) >= (GVL_CONSTANTS.C_MS_IN_MINUTE * 5) THEN
+    IF F_TimeDiff(VI_System_Time_MS, L_Lockout_Start_Time) >= VO_State.timeout_ms THEN
         VO_State.Is_Locked := FALSE;
     END_IF;
 END_IF;
@@ -5735,7 +5808,7 @@ CASE L_State OF
     0: // Ожидание
         IF VI_Start_Test THEN
             VO_Test_Active := TRUE;
-            VO_Result := E_Valve_Test_Result.TEST_IN_PROGRESS;
+            VO_Result := E_Valve_Test_Result.TEST_RESULT_IN_PROGRESS;
             L_Start_Time := VI_System_Time_MS;
             VO_Valve_Cmd := TRUE; // Открыть
             L_State := 1;
@@ -5743,7 +5816,7 @@ CASE L_State OF
     1: // Тест
         IF F_TimeDiff(VI_System_Time_MS, L_Start_Time) > 5000 THEN
             VO_Valve_Cmd := FALSE; // Закрыть
-            VO_Result := E_Valve_Test_Result.TEST_PASSED; // Заглушка, нужен контроль концевиков
+            VO_Result := E_Valve_Test_Result.TEST_RESULT_PASSED; // Заглушка, нужен контроль концевиков
             VO_Test_Active := FALSE;
             L_State := 0;
         END_IF;
@@ -5854,7 +5927,7 @@ VAR_INPUT
     VI_Outdoor_Temp : REAL; // Уличная температура воздуха (°C)
     VI_Supply_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_SUPPLY_TEMPS] OF REAL; // Температура приточного воздуха после калорифера
     VI_Room_Temps : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Температура в помещениях (°C)
-    VI_Room_Humidities : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Влажность в помещениях (%)
+    VI_Room_Humidities : ARRAY[1..GVL_CONSTANTS.C_MAX_HUMIDITY_SENSORS] OF REAL; // Влажность в мокрых зонах (%)
     VI_Room_CO2 : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF REAL; // Уровень CO2 в помещениях (ppm)
     VI_Current_Scenario : E_SCENARIO_TYPE; // Текущий глобальный сценарий
     VI_Config : ST_Ventilation_Global_Config; // Конфигурация системы вентиляции
@@ -6160,6 +6233,118 @@ METHOD GetStatus : BYTE
 END_METHOD
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+FUNCTION_BLOCK FB_Interface_Contract_Validator
+VAR_INPUT
+    VI_System_Time_MS : UDINT;
+    VI_Enable : BOOL;
+    VI_Strict_Mode : BOOL;
+    VI_Manifold_Valves : ARRAY[1..GVL_CONSTANTS.C_MAX_MANIFOLDS] OF REAL;
+    VI_Boiler_Setpoints : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF REAL;
+    VI_Supply_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_SUPPLY_FANS] OF BYTE;
+    VI_Exhaust_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_EXHAUST_FANS] OF BYTE;
+    VI_Lighting_Levels : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BYTE;
+    VI_Blinds_Positions : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF BYTE;
+    VI_DALI_Zone_Map : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF UINT;
+    VI_KNX_Blinds_Map : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF UINT;
+END_VAR
+VAR_OUTPUT
+    VO_Manifold_Valves : ARRAY[1..GVL_CONSTANTS.C_MAX_MANIFOLDS] OF REAL;
+    VO_Boiler_Setpoints : ARRAY[1..GVL_CONSTANTS.C_MAX_BOILERS] OF REAL;
+    VO_Supply_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_SUPPLY_FANS] OF BYTE;
+    VO_Exhaust_Fans : ARRAY[1..GVL_CONSTANTS.C_MAX_EXHAUST_FANS] OF BYTE;
+    VO_Lighting_Levels : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BYTE;
+    VO_Blinds_Positions : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF BYTE;
+    VO_Status : ST_Hardware_Integration_Status;
+END_VAR
+VAR
+    L_i : INT;
+END_VAR
+
+VO_Status := (output_contract_ok := TRUE, lighting_contract_ok := TRUE, blinds_contract_ok := TRUE, vent_contract_ok := TRUE, heating_contract_ok := TRUE, last_error_code := 0, last_error_text := '', last_update_ms := VI_System_Time_MS);
+
+IF NOT VI_Enable THEN
+    VO_Manifold_Valves := VI_Manifold_Valves;
+    VO_Boiler_Setpoints := VI_Boiler_Setpoints;
+    VO_Supply_Fans := VI_Supply_Fans;
+    VO_Exhaust_Fans := VI_Exhaust_Fans;
+    VO_Lighting_Levels := VI_Lighting_Levels;
+    VO_Blinds_Positions := VI_Blinds_Positions;
+    RETURN;
+END_IF;
+
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_MANIFOLDS DO
+    VO_Manifold_Valves[L_i] := LIMIT(0.0, VI_Manifold_Valves[L_i], 100.0);
+    IF VO_Manifold_Valves[L_i] <> VI_Manifold_Valves[L_i] THEN
+        VO_Status.heating_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E301;
+        VO_Status.last_error_text := 'Heating valve command out of range';
+    END_IF;
+END_FOR;
+
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_BOILERS DO
+    VO_Boiler_Setpoints[L_i] := LIMIT(0.0, VI_Boiler_Setpoints[L_i], 100.0);
+    IF VO_Boiler_Setpoints[L_i] <> VI_Boiler_Setpoints[L_i] THEN
+        VO_Status.heating_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E302;
+        VO_Status.last_error_text := 'Boiler setpoint out of range';
+    END_IF;
+END_FOR;
+
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_SUPPLY_FANS DO
+    VO_Supply_Fans[L_i] := LIMIT(TO_BYTE(0), VI_Supply_Fans[L_i], TO_BYTE(100));
+    IF VO_Supply_Fans[L_i] <> VI_Supply_Fans[L_i] THEN
+        VO_Status.vent_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E303;
+        VO_Status.last_error_text := 'Supply fan command out of range';
+    END_IF;
+END_FOR;
+
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_EXHAUST_FANS DO
+    VO_Exhaust_Fans[L_i] := LIMIT(TO_BYTE(0), VI_Exhaust_Fans[L_i], TO_BYTE(100));
+    IF VO_Exhaust_Fans[L_i] <> VI_Exhaust_Fans[L_i] THEN
+        VO_Status.vent_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E304;
+        VO_Status.last_error_text := 'Exhaust fan command out of range';
+    END_IF;
+END_FOR;
+
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_ZONES DO
+    VO_Lighting_Levels[L_i] := LIMIT(TO_BYTE(0), VI_Lighting_Levels[L_i], TO_BYTE(100));
+    IF VO_Lighting_Levels[L_i] <> VI_Lighting_Levels[L_i] THEN
+        VO_Status.lighting_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E305;
+        VO_Status.last_error_text := 'Lighting level out of range';
+    END_IF;
+    IF VI_Strict_Mode AND VI_DALI_Zone_Map[L_i] = 0 THEN
+        VO_Status.lighting_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E306;
+        VO_Status.last_error_text := 'Missing DALI zone map';
+    END_IF;
+END_FOR;
+
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_BLINDS DO
+    VO_Blinds_Positions[L_i] := LIMIT(TO_BYTE(0), VI_Blinds_Positions[L_i], TO_BYTE(100));
+    IF VO_Blinds_Positions[L_i] <> VI_Blinds_Positions[L_i] THEN
+        VO_Status.blinds_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E307;
+        VO_Status.last_error_text := 'Blinds position out of range';
+    END_IF;
+    IF VI_Strict_Mode AND VI_KNX_Blinds_Map[L_i] = 0 THEN
+        VO_Status.blinds_contract_ok := FALSE;
+        VO_Status.output_contract_ok := FALSE;
+        VO_Status.last_error_code := 16#E308;
+        VO_Status.last_error_text := 'Missing KNX blinds map';
+    END_IF;
+END_FOR;
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 PROGRAM MAIN
 VAR
 END_VAR
@@ -6180,11 +6365,27 @@ PRG_IO_Write();
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 PROGRAM PRG_Heating
 VAR
-    fbHeatingManager : FB_Heating_System_Manager;
     fbDHWManager : FB_DHW_Manager;
+    fbHeatingManager : FB_Heating_System_Manager;
     fbValveTestManager : FB_Valve_Test_Manager;
     L_i : INT;
 END_VAR
+
+// 12. Управление ГВС
+fbDHWManager(
+    VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
+    VI_Current_TOD := GVL_STATUS.G_Current_TOD,
+    VI_IsActivePLC := GVL_STATUS.G_Is_Active_PLC,
+    VI_Temp := GVL_STATE.G_DHW_Temp,
+    VI_Pressure := GVL_STATE.G_DHW_Pressure,
+    VI_Config := GVL_CONFIG.G_DHW_Config,
+    VI_Current_Day_Of_Week := GVL_STATUS.G_Current_Day,
+    VI_IO_Modules_Online := GVL_STATUS.G_IO_Modules_Online,
+    VI_Reset_Errors := GVL_COMMAND.G_Reset_Errors,
+    VO_Heating_Pump => GVL_STATE.G_DHW_Heating_Pump,
+    VO_Circ_Pump => GVL_STATE.G_DHW_Circ_Pump,
+    VO_Status => GVL_STATUS.G_DHW_Status
+);
 
 // 9. Управление климатом (Отопление)
 fbHeatingManager(
@@ -6206,7 +6407,7 @@ fbHeatingManager(
     VI_Rule_Actions := GVL_STATE.G_Rule_Actions,
     VI_Boiler_Stop := GVL_COMMAND.G_Boiler_Stop,
     VI_IO_Modules_Online := GVL_STATUS.G_IO_Modules_Online,
-    VI_DHW_Heating_Demand := fbDHWManager.VO_Heating_Pump,
+    VI_DHW_Heating_Demand := GVL_STATE.G_DHW_Heating_Pump,
     VI_DHW_Target_Temp := GVL_CONFIG.G_DHW_Config.Target_Temp,
     VI_Current_Scenario := GVL_STATUS.G_Current_Scenario,
     VI_Scenario_Configs := GVL_CONFIG.G_HMI_Scenario_Configs,
@@ -6237,22 +6438,6 @@ IF fbValveTestManager.VO_Test_Active THEN
         END_IF;
     END_FOR;
 END_IF;
-
-// 12. Управление ГВС
-fbDHWManager(
-    VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
-    VI_Current_TOD := GVL_STATUS.G_Current_TOD,
-    VI_IsActivePLC := GVL_STATUS.G_Is_Active_PLC,
-    VI_Temp := GVL_STATE.G_DHW_Temp,
-    VI_Pressure := GVL_STATE.G_DHW_Pressure,
-    VI_Config := GVL_CONFIG.G_DHW_Config,
-    VI_Current_Day_Of_Week := GVL_STATUS.G_Current_Day,
-    VI_IO_Modules_Online := GVL_STATUS.G_IO_Modules_Online,
-    VI_Reset_Errors := GVL_COMMAND.G_Reset_Errors,
-    VO_Heating_Pump => GVL_STATE.G_DHW_Heating_Pump,
-    VO_Circ_Pump => GVL_STATE.G_DHW_Circ_Pump,
-    VO_Status => GVL_STATUS.G_DHW_Status
-);
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 PROGRAM PRG_IO_Read
@@ -6297,7 +6482,7 @@ L_IO_Error_Active := fbIO_Watchdog_1.VO_Error_Active OR fbIO_Watchdog_2.VO_Error
 IF L_IO_Error_Active THEN
     GVL_COMMAND.G_Gas_Valve_Close := TRUE;
     GVL_COMMAND.G_Close_Valve_35 := TRUE;
-    GVL_STATE.G_Close_Valve_36 := TRUE;
+    GVL_COMMAND.G_Close_Valve_36 := TRUE;
     FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_BOILERS DO GVL_STATE.G_Boiler_Enable[L_i] := FALSE; END_FOR;
     FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_MANIFOLDS DO GVL_STATE.G_Manifold_Pumps[L_i] := FALSE; END_FOR;
 END_IF;
@@ -6359,8 +6544,10 @@ FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_SUPPLY_TEMPS DO
     END_IF;
 END_FOR;
 
-FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_ZONES DO
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_HUMIDITY_SENSORS DO
     GVL_STATE.G_Room_Hum[L_i] := GVL_IO.AI_Room_Hum[L_i];
+END_FOR;
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_ZONES DO
     GVL_STATE.G_Room_CO2[L_i] := GVL_IO.AI_Room_CO2[L_i];
 END_FOR;
 FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_ZONES DO
@@ -6398,7 +6585,27 @@ GVL_STATE.G_DHW_Pressure := GVL_IO.AI_DHW_Pressure;
 PROGRAM PRG_IO_Write
 VAR
     L_i : INT;
+    L_Lighting_Changed : BOOL;
+    L_Blinds_Changed : BOOL;
+    L_Prev_Lighting_Levels : ARRAY[1..GVL_CONSTANTS.C_MAX_ZONES] OF BYTE;
+    L_Prev_Blinds_Positions : ARRAY[1..GVL_CONSTANTS.C_MAX_BLINDS] OF BYTE;
+    fbInterfaceValidator : FB_Interface_Contract_Validator;
 END_VAR
+
+fbInterfaceValidator(
+    VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
+    VI_Enable := GVL_CONFIG.G_Hardware_Interface_Enable,
+    VI_Strict_Mode := GVL_CONFIG.G_Hardware_Interface_Strict_Mode,
+    VI_Manifold_Valves := GVL_STATE.G_Manifold_Valves,
+    VI_Boiler_Setpoints := GVL_STATE.G_Boiler_Setpoint,
+    VI_Supply_Fans := GVL_STATE.G_Supply_Fans,
+    VI_Exhaust_Fans := GVL_STATE.G_Exhaust_Fans,
+    VI_Lighting_Levels := GVL_STATE.G_Lighting_Levels,
+    VI_Blinds_Positions := GVL_STATE.G_Blinds_Positions,
+    VI_DALI_Zone_Map := GVL_CONFIG.G_DALI_Zone_Map,
+    VI_KNX_Blinds_Map := GVL_CONFIG.G_KNX_Blinds_Map,
+    VO_Status => GVL_STATUS.G_Hardware_Interface_Status
+);
 
 // 2. ЗАПИСЬ ВЫХОДОВ (GVL_STATE -> GVL_IO)
 
@@ -6408,31 +6615,49 @@ GVL_IO.DO_Zone_Valves := GVL_STATE.G_Zone_Valves;
 // 2.2. Коллекторы (Насосы и смесительные клапаны)
 FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_MANIFOLDS DO
     GVL_IO.DO_Manifold_Pumps[L_i] := GVL_STATE.G_Manifold_Pumps[L_i];
-    // Масштабирование 0.0-1.0 в 0-1000 для аналогового выхода (0-10В)
-    GVL_IO.AO_Manifold_Valves[L_i] := REAL_TO_UINT(GVL_STATE.G_Manifold_Valves[L_i] * 1000.0);
+    // Масштабирование 0.0-100.0% в 0-1000 для аналогового выхода (0-10В)
+    GVL_IO.AO_Manifold_Valves[L_i] := REAL_TO_UINT(fbInterfaceValidator.VO_Manifold_Valves[L_i] * 10.0);
 END_FOR;
 
 // 2.3. Котлы
 FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_BOILERS DO
     GVL_IO.DO_Boiler_Enable[L_i] := GVL_STATE.G_Boiler_Enable[L_i];
     // Масштабирование уставки (например, 0-100 градусов в 0-1000 для 0-10В)
-    GVL_IO.AO_Boiler_Setpoint[L_i] := REAL_TO_UINT(GVL_STATE.G_Boiler_Setpoint[L_i] * 10.0);
+    GVL_IO.AO_Boiler_Setpoint[L_i] := REAL_TO_UINT(fbInterfaceValidator.VO_Boiler_Setpoints[L_i] * 10.0);
 END_FOR;
 
 // 2.4. Вентиляция
 FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_SUPPLY_FANS DO
-    GVL_IO.AO_Supply_Fans[L_i] := REAL_TO_UINT(GVL_STATE.G_Supply_Fans[L_i] * 100.0);
+    GVL_IO.AO_Supply_Fans[L_i] := TO_UINT(fbInterfaceValidator.VO_Supply_Fans[L_i]) * 10;
 END_FOR;
 FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_EXHAUST_FANS DO
-    GVL_IO.AO_Exhaust_Fans[L_i] := REAL_TO_UINT(GVL_STATE.G_Exhaust_Fans[L_i] * 100.0);
+    GVL_IO.AO_Exhaust_Fans[L_i] := TO_UINT(fbInterfaceValidator.VO_Exhaust_Fans[L_i]) * 10;
 END_FOR;
 
 // 2.5. ГВС
 GVL_IO.DO_DHW_Heating_Pump := GVL_STATE.G_DHW_Heating_Pump;
 GVL_IO.DO_DHW_Circ_Pump := GVL_STATE.G_DHW_Circ_Pump;
 
-// 2.6. Освещение и шторы (заглушки для DALI/KNX шлюзов)
-// В реальном проекте здесь будет передача по Modbus/DALI, пока оставляем как есть
+// 2.6. Освещение и шторы (контракт драйверного уровня для DALI/KNX шлюзов)
+L_Lighting_Changed := FALSE;
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_ZONES DO
+    GVL_GATEWAY.G_DALI_Lighting_Levels[L_i] := fbInterfaceValidator.VO_Lighting_Levels[L_i];
+    IF fbInterfaceValidator.VO_Lighting_Levels[L_i] <> L_Prev_Lighting_Levels[L_i] THEN
+        L_Lighting_Changed := TRUE;
+        L_Prev_Lighting_Levels[L_i] := fbInterfaceValidator.VO_Lighting_Levels[L_i];
+    END_IF;
+END_FOR;
+GVL_GATEWAY.G_DALI_Command_Update := L_Lighting_Changed;
+
+L_Blinds_Changed := FALSE;
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_BLINDS DO
+    GVL_GATEWAY.G_KNX_Blinds_Positions[L_i] := fbInterfaceValidator.VO_Blinds_Positions[L_i];
+    IF fbInterfaceValidator.VO_Blinds_Positions[L_i] <> L_Prev_Blinds_Positions[L_i] THEN
+        L_Blinds_Changed := TRUE;
+        L_Prev_Blinds_Positions[L_i] := fbInterfaceValidator.VO_Blinds_Positions[L_i];
+    END_IF;
+END_FOR;
+GVL_GATEWAY.G_KNX_Command_Update := L_Blinds_Changed;
 
 // 2.7. Аварийные выходы (Сирены и клапаны)
 IF GVL_ALARM.G_Gas_Fire_Siren AND GVL_ALARM.G_Gas_Alarm_Active THEN
@@ -6459,7 +6684,7 @@ ELSE
     GVL_IO.DO_Water_Valve_35_Close := FALSE;
 END_IF;
 
-IF GVL_STATE.G_Close_Valve_36 THEN
+IF GVL_COMMAND.G_Close_Valve_36 THEN
     GVL_IO.DO_Water_Valve_36_Close := TRUE;
 ELSE
     GVL_IO.DO_Water_Valve_36_Close := FALSE;
@@ -6532,7 +6757,7 @@ VAR
 END_VAR
 
 // Вызов основной программы
-PRG_Main();
+MAIN();
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 PROGRAM PRG_PLC_B
@@ -6541,7 +6766,7 @@ VAR
 END_VAR
 
 // Вызов основной программы
-PRG_Main();
+MAIN();
 
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 PROGRAM PRG_Safety
@@ -6611,8 +6836,8 @@ fbSecurityManager(
     VO_Alarm_Active => GVL_ALARM.G_Security_Alarm,
     VO_Siren_Active => GVL_ALARM.G_Security_Siren,
     VO_Status_Msg => GVL_STATUS.G_Security_Status_Msg,
-    VO_Send_Code_Req => GVL_COMMAND.G_Send_2FA_Req,
-    VO_Code_To_Send => GVL_COMMAND.G_2FA_Code_Out
+    VO_Send_Code_Req => GVL_GATEWAY.G_Gateway_Send_2FA,
+    VO_Code_To_Send => GVL_GATEWAY.G_Gateway_2FA_Code
 );
 
 // 7.1 Контроль доступа (СКУД)
@@ -6652,6 +6877,11 @@ VAR
     fbAstroTimer : FB_Astro_Timer;
     fbAlarmManager : FB_Alarm_Manager;
     fbHistoryManager : FB_History_Manager;
+    fbDebugLogger : FB_Debug_Logger;
+    fbOutdoorTrend : FB_Trend_Logger;
+    fbMethaneTrend : FB_Trend_Logger;
+    fbStateSnapshot : FB_State_Snapshot_Manager;
+    fbSnapshotCRC : FB_CRC32_Calculator;
     
     L_Time_Diff : UDINT;
     L_Local_State : ST_System_State_Snapshot;
@@ -6666,6 +6896,11 @@ VAR
     L_BB_Freeze : BOOL;
     L_Scenario_Idx : INT;
     L_i : INT;
+    L_Diag_Error_Code : UDINT;
+    L_Snapshot_Trigger : BOOL;
+    L_Prev_Snapshot_Alarm : BOOL;
+    L_Prev_Snapshot_Scenario : E_SCENARIO_TYPE;
+    L_State_Snapshot : ST_State_Snapshot;
 END_VAR
 
 // 0. Инициализация RETAIN переменных при первом запуске
@@ -6756,6 +6991,7 @@ END_IF;
 // 4. Астрономический таймер
 fbAstroTimer(
     VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
+    VI_Current_TOD := GVL_STATUS.G_Current_TOD,
     VI_Latitude := 55.75,
     VI_Longitude := 37.61,
     VI_Day_Of_Year := GVL_STATUS.G_Day_Of_Year,
@@ -6771,7 +7007,7 @@ fbScenarioManager(
 );
 
 L_Scenario_Idx := TO_INT(GVL_STATUS.G_Current_Scenario);
-IF L_Scenario_Idx < 1 OR L_Scenario_Idx > 6 THEN
+IF L_Scenario_Idx < 1 OR L_Scenario_Idx > GVL_CONSTANTS.C_MAX_SCENARIOS THEN
     L_Scenario_Idx := 1;
 END_IF;
 
@@ -6834,6 +7070,58 @@ fbAlarmManager(
     VO_Alarm_List => GVL_ALARM.G_Alarm_List
 );
 
+// 9.0 Служебная диагностика и сервисные блоки Stage 1
+IF L_NVRAM_Err THEN
+    L_Diag_Error_Code := L_NVRAM_ErrID;
+ELSIF GVL_ALARM.G_Global_Critical THEN
+    L_Diag_Error_Code := 16#E100;
+ELSIF GVL_ALARM.G_Global_Warning THEN
+    L_Diag_Error_Code := 16#E010;
+ELSE
+    L_Diag_Error_Code := 0;
+END_IF;
+
+fbDebugLogger(
+    VI_Config := (enabled := TRUE, sampling_period_ms := GVL_CONSTANTS.C_MS_IN_MINUTE),
+    VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
+    VI_Floor_Temps := GVL_STATE.G_Floor_Temps,
+    VI_Pump_Currents := GVL_STATE.G_Manifold_Currents,
+    VI_Error_Code := L_Diag_Error_Code
+);
+
+fbOutdoorTrend(
+    VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
+    VI_Config := (param_type := TO_BYTE(E_Trend_Parameter_Type.TREND_PARAM_TEMP_AIR), zone_id := 0, enabled := TRUE, deviation_threshold_percent := 5.0, history_days := 7),
+    VI_Current_Value := GVL_STATE.G_Outdoor_Temp
+);
+
+fbMethaneTrend(
+    VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
+    VI_Config := (param_type := TO_BYTE(E_Trend_Parameter_Type.TREND_PARAM_GAS_METHANE), zone_id := 1, enabled := TRUE, deviation_threshold_percent := 5.0, history_days := 7),
+    VI_Current_Value := GVL_STATE.G_Methane_Sensors[1]
+);
+
+L_Snapshot_Trigger := (GVL_ALARM.G_Global_Critical AND NOT L_Prev_Snapshot_Alarm) OR (GVL_STATUS.G_Current_Scenario <> L_Prev_Snapshot_Scenario);
+L_State_Snapshot.timestamp_ms := GVL_STATUS.G_System_Time_MS;
+L_State_Snapshot.operator_id := 'SYSTEM';
+L_State_Snapshot.scenario_id := GVL_STATUS.G_Current_Scenario;
+L_State_Snapshot.lighting_levels := GVL_STATE.G_Lighting_Levels;
+FOR L_i := 1 TO GVL_CONSTANTS.C_MAX_ZONES DO
+    L_State_Snapshot.floor_heating_setpoints[L_i] := GVL_CONFIG.G_HMI_FloorHeating_Configs[L_i].design_temp;
+END_FOR;
+L_State_Snapshot.alarm_active := GVL_ALARM.G_Global_Critical OR GVL_ALARM.G_Global_Warning;
+L_State_Snapshot.crc32 := 0;
+L_State_Snapshot.crc32 := fbSnapshotCRC.Calculate(ADR(L_State_Snapshot), SIZEOF(L_State_Snapshot) - SIZEOF(L_State_Snapshot.crc32));
+
+fbStateSnapshot(
+    VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
+    VI_Trigger_Event := L_Snapshot_Trigger,
+    VI_Event_Code := SEL(GVL_ALARM.G_Global_Critical, 1001, 9001),
+    VI_Current_State := L_State_Snapshot
+);
+L_Prev_Snapshot_Alarm := GVL_ALARM.G_Global_Critical;
+L_Prev_Snapshot_Scenario := GVL_STATUS.G_Current_Scenario;
+
 // 13. Интерфейс шлюза (Modbus TCP)
 fbGateway(
     VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
@@ -6855,8 +7143,8 @@ fbGateway(
     VI_Socket_States := GVL_STATE.G_Socket_States,
     VI_Blinds_Positions := GVL_STATE.G_Blinds_Positions,
     VI_Active_Scenario := GVL_STATUS.G_Current_Scenario,
-    VI_Send_2FA_Req := GVL_COMMAND.G_Send_2FA_Req,
-    VI_2FA_Code := GVL_COMMAND.G_2FA_Code_Out,
+    VI_Send_2FA_Req := GVL_GATEWAY.G_Gateway_Send_2FA,
+    VI_2FA_Code := GVL_GATEWAY.G_Gateway_2FA_Code,
     VI_Allowed_IPs := GVL_CONFIG.G_Allowed_IPs,
     VO_Telegram_Msg => GVL_GATEWAY.G_Gateway_Telegram_Msg,
     VO_Send_Telegram => GVL_GATEWAY.G_Gateway_Send_Telegram,
@@ -6944,7 +7232,7 @@ IF GVL_STATUS.G_Current_Scenario <> GVL_STATUS.G_Previous_Scenario THEN
     fbHistoryManager(
         VI_System_Time_MS := GVL_STATUS.G_System_Time_MS,
         VI_Write_Event := TRUE,
-        VI_Event := (timestamp_ms := GVL_STATUS.G_System_Time_MS, event_code := 1001, event_value := TO_REAL(GVL_STATUS.G_Current_Scenario), unit := 0, zone_id := 0, operator_id := 'SYSTEM', priority := E_ALERT_PRIORITY.ALERT_PRIORITY_INFO)
+        VI_Event := (timestamp_ms := GVL_STATUS.G_System_Time_MS, event_code := 1001, event_value := TO_REAL(GVL_STATUS.G_Current_Scenario), unit := 0, zone_id := 0, operator_id := 'SYSTEM', priority := E_ALERT_PRIORITY.ALERT_PRIORITY_LOW)
     );
     GVL_STATUS.G_Previous_Scenario := GVL_STATUS.G_Current_Scenario;
 ELSE
@@ -6969,6 +7257,7 @@ VAR
     L_Test1_Passed : BOOL;
     L_Test2_Passed : BOOL;
     L_Test3_Passed : BOOL;
+    L_Random_Value : UDINT;
 END_VAR
 
 // Имитация системного времени
@@ -6986,7 +7275,7 @@ CASE L_Test_Step OF
             VI_Fallback_Mode := 0,
             VI_Default_Value := 20.0
         );
-        IF fbAnalogValidator.VO_Valid AND fbAnalogValidator.VO_Validated_Value = 25.0 THEN
+        IF NOT fbAnalogValidator.VO_Error AND fbAnalogValidator.VO_Value = 25.0 THEN
             L_Test1_Passed := TRUE;
             L_Tests_Passed := L_Tests_Passed + 1;
         ELSE
@@ -7003,7 +7292,7 @@ CASE L_Test_Step OF
             VI_Fallback_Mode := 1,
             VI_Default_Value := 20.0
         );
-        IF NOT fbAnalogValidator.VO_Valid AND fbAnalogValidator.VO_Validated_Value = 20.0 THEN
+        IF fbAnalogValidator.VO_Error AND fbAnalogValidator.VO_Value = 20.0 THEN
             L_Test2_Passed := TRUE;
             L_Tests_Passed := L_Tests_Passed + 1;
         ELSE
@@ -7013,9 +7302,9 @@ CASE L_Test_Step OF
         L_Test_Step := 3;
         
     3: // Тест 3: FB_Random_Generator - Диапазон
-        fbRandomGenerator.Seed(12345);
-        fbRandomGenerator.Random_Int_Range(VI_min := 10, VI_max := 20, VI_System_Time_MS := L_System_Time);
-        IF fbRandomGenerator.VO_Random_Value >= 10 AND fbRandomGenerator.VO_Random_Value <= 20 THEN
+        fbRandomGenerator.Seed(VI_Seed_Value := 12345);
+        L_Random_Value := fbRandomGenerator.Random_Int_Range(VI_min := 10, VI_max := 20, VI_System_Time_MS := L_System_Time);
+        IF L_Random_Value >= 10 AND L_Random_Value <= 20 THEN
             L_Test3_Passed := TRUE;
             L_Tests_Passed := L_Tests_Passed + 1;
         ELSE
@@ -7055,9 +7344,9 @@ fbVentilationManager(
     VI_Vent_Stop := GVL_COMMAND.G_Vent_Stop,
     VI_Wet_Zone_Active := GVL_STATUS.G_Wet_Zone_Light_Active,
     VI_Rule_Actions := GVL_STATE.G_Rule_Actions,
+    VI_IO_Modules_Online := GVL_STATUS.G_IO_Modules_Online,
     VO_Supply_Fans => GVL_STATE.G_Supply_Fans,
     VO_Exhaust_Fans => GVL_STATE.G_Exhaust_Fans,
     VO_Heater_Power => GVL_STATE.G_Vent_Heater_Power,
     VO_Status_Msg => GVL_STATUS.G_Vent_Status_Msg
 );
-
